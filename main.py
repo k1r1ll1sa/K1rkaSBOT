@@ -1,5 +1,4 @@
 """Модуль для интерфейса программы"""
-import asyncio
 import os
 
 from PyQt5.QtCore import *
@@ -86,6 +85,7 @@ class Root(QMainWindow):
         self.console_textedit = QTextEdit("Hello! It`s a console!", parent=self)
         self.console_textedit.setFont(QFont("Times New Roman", 11))
         self.console_textedit.setAlignment(Qt.AlignLeft)
+        self.console_textedit.setReadOnly(True)
         self.console_textedit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # Поле для ввода команд
