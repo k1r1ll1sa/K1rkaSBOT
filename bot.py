@@ -1,5 +1,6 @@
 """Модуль с функционалом бота"""
 import random
+from os.path import split
 
 import httpx
 import requests
@@ -9,7 +10,9 @@ from twitchio.ext import commands
 from twitchio.models import PartialUser
 from twitchio.http import TwitchHTTP
 import asyncio
-import datetime
+from datetime import datetime, timezone
+from dateutil.parser import parse
+from googletrans import Translator
 import json
 
 def init_bot(nickname, root):
@@ -63,6 +66,16 @@ class Bot(commands.Bot):
         self.prew_viewers = 0
         self.cur_viewers = 0
 
+        # Розыгрыш
+        self.raffle_key_word = '+'
+        self.raffle_player_list = []
+        self.raffle_flag = False
+        self.raffle_black_list = []
+
+        # Задача
+        self.answer = 0
+        self.task_flag = False
+
         super().__init__(
             prefix='!',
             token=self.token,
@@ -96,7 +109,13 @@ class Bot(commands.Bot):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!вуз"')
 
     @commands.command(name='рулетка')
-    async def roulette(self, ctx: commands.Context, count=1):
+    async def roulette(self, ctx: commands.Context, count='1'):
+        if '\U000e0000' in count:
+            count = 1
+        try:
+            count = int(count)
+        except ValueError:
+            count = 1
         self.root.console_add_line(f'{ctx.author.name} uses the command "!рулетка"') if count == 1 else (
             self.root.console_add_line(f'{ctx.author.name} uses the command "!рулетка" with arguments {count}'))
         if count > 1:
@@ -149,17 +168,99 @@ class Bot(commands.Bot):
             await ctx.send(f'{ctx.author.name} выпало число {random_cube} 🎲')
 
     @commands.command(name='копать')
-    async def mine(self, ctx: commands.Context):
+    async def mine(self, ctx: commands.Context, command: str = '', *, phrase: str = ''):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!копать"')
+        if '\U000e0000' in phrase:
+            phrase = phrase.replace('\U000e0000', '')
+            phrase = phrase.strip()
         with open('info.json', 'r', encoding='utf-8') as f:
             info = json.load(f)
-        phrase = random.choice(info['mine'])
+        if ctx.author.is_mod and command == 'добавить' and phrase != '':
+            if phrase not in list(info['mine'].values()):
+                max_key = max(int(k) for k in info['mine'].keys()) if info['mine'] else 0
+                next_key = str(max_key + 1)
+                info['mine'][next_key] = phrase
+                with open('info.json', 'w', encoding='utf-8') as f:
+                    json.dump(info, f, ensure_ascii=False, indent=4)
+                await ctx.send(f'Фраза "{phrase}" добавлена в список!')
+            else:
+                await ctx.send(f'Фраза "{phrase}" уже есть в списке!')
+            return
+
+        if ctx.author.is_mod and command.lower() == 'список':
+            if not info['mine']:
+                await ctx.send("Список фраз пуст!")
+                return
+            try:
+                page = int(phrase) if phrase else 1
+            except ValueError:
+                page = 1
+
+            sorted_phrases = sorted(info['mine'].items(), key=lambda x: int(x[0]))
+            total_phrases = len(sorted_phrases)
+            phrases_per_page = 5
+
+            # Уменьшение контента, если он не помещается на 1 страницу (450 символов)
+            while True:
+                test_message = "Список фраз (страница 1/1): " + "".join(f"{num} - {text}, " for num, text in sorted_phrases[:phrases_per_page])
+                if len(test_message) <= 450 or phrases_per_page <= 1:
+                    break
+                phrases_per_page -= 1
+            total_pages = (total_phrases + phrases_per_page - 1) // phrases_per_page
+            page = max(1, min(page, total_pages))
+            start_idx = (page - 1) * phrases_per_page
+            end_idx = min(start_idx + phrases_per_page, total_phrases)
+            phrases_list = "".join(f"{num} - {text}, " for num, text in sorted_phrases[start_idx:end_idx])
+
+            if phrases_list.endswith(', '):
+                phrases_list = phrases_list[:-2] + '...'
+            message = (f"Список фраз (страница {page}/{total_pages}): {phrases_list}")
+            if len(message) > 450:
+                message = message[:447] + "..."
+            await ctx.send(message)
+            return
+
+        if ctx.author.is_mod and command.lower() == 'удалить':
+            if not phrase:
+                await ctx.send("Укажите номер фразы для удаления!")
+                return
+            try:
+                del_key = phrase
+                if del_key not in info['mine']:
+                    await ctx.send(f"Фраза с номером {del_key} не найдена!")
+                    return
+
+                deleted_phrase = info['mine'].pop(del_key)
+                new_mine = {}
+                current_num = 1
+
+                # Сдвиг ключей
+                for old_num in sorted(info['mine'].keys(), key=int):
+                    new_mine[str(current_num)] = info['mine'][old_num]
+                    current_num += 1
+
+                info['mine'] = new_mine
+                with open('info.json', 'w', encoding='utf-8') as f:
+                    json.dump(info, f, ensure_ascii=False, indent=4)
+                await ctx.send(f'Фраза "{deleted_phrase}" (№{del_key}) удалена!')
+            except ValueError:
+                await ctx.send("Номер фразы должен быть числом!")
+            return
+
+        # если отправитель не модератор или не использует под-команды выше
+        phrase = random.choice(list(info['mine'].values()))
         await ctx.send(f'{ctx.author.name} {phrase}!')
 
     @commands.command(name='чай')
     async def tea(self, ctx: commands.Context, user=None):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!чай" with arguments {user}')\
             if user else self.root.console_add_line(f'{ctx.author.name} uses the command "!чай"')
+        if user is not None:
+            user = user.lower()
+            if '@' in user:
+                user = user.replace('@', '')
+                print(user)
+        print(self.chatters)
         if user and user in self.chatters:
             await ctx.send(f'{ctx.author.name} угостил чаем {user}')
         else:
@@ -172,7 +273,7 @@ class Bot(commands.Bot):
             await ctx.send('Угадай цвет, чтобы разминировать бомбу! (!зелёный, !красный, !синий)')
             self.correct_color = random.choice(self.colors)
 
-    @commands.command(name='зелёный', aliases=['зеленый', 'green']) # с альтернативными враиантами
+    @commands.command(name='зелёный', aliases=['зеленый', 'green']) # с альтернативными вариантами
     async def bomb_green(self, ctx: commands.Context):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!зелёный"')
         if self.correct_color is not None:
@@ -243,7 +344,7 @@ class Bot(commands.Bot):
             else:
                 encoded_word = urllib.parse.quote(self.correct_word.lower())
                 wiki_url = f"https://ru.wikipedia.org/w/index.php?search={encoded_word}"
-                await ctx.send(f'{ctx.author.name} вы отгадали все буквы! Загаданое слово: {self.correct_word}. '
+                await ctx.send(f'{ctx.author.name} вы отгадали все буквы! Загаданное слово: {self.correct_word}. '
                                f'Почитать здесь -> {wiki_url}')
                 self.correct_word = None
         elif word not in self.words:
@@ -267,9 +368,11 @@ class Bot(commands.Bot):
             return 0, 'Трансляция не ведется'
 
     def calculate_stream_duration(self, started_at):
-        start_time = datetime.fromisoformat(started_at[:-1])
+        start_time = parse(started_at[:-1] if started_at.endswith('Z') else started_at)
         duration = datetime.utcnow() - start_time
-        return str(duration).split('.')[0]
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
 
     @commands.command(name='зрители')
     async def viewers_info(self, ctx: commands.Context):
@@ -277,32 +380,146 @@ class Bot(commands.Bot):
             self.cur_viewer, stream_dur = await self.get_viewer_count()
             diff = self.cur_viewer - self.prew_viewers
             if diff == 0:
-                await ctx.send(f'{self.cur_viewer} ({stream_dur})!')
+                await ctx.send(f'{self.cur_viewer} ({stream_dur} 🕝)!')
             elif diff > 0:
-                await ctx.send(f'{self.cur_viewer} + {diff} ({stream_dur})!')
+                await ctx.send(f'{self.cur_viewer} (+{diff}👤) ({stream_dur} 🕝)!')
             elif diff < 0:
-                await ctx.send(f'{self.cur_viewer} - {diff} ({stream_dur})!')
+                await ctx.send(f'{self.cur_viewer} ({diff}👤) ({stream_dur} 🕝)!')
             self.prew_viewers = self.cur_viewer
 
     async def viewer_timer(self):
         self.cur_viewer, stream_dur = await self.get_viewer_count()
         diff = self.cur_viewer - self.prew_viewers
         if diff == 0:
-            await self.channel.send(f'{self.cur_viewer} ({stream_dur})!')
+            await self.channel.send(f'{self.cur_viewer} ({stream_dur} 🕝)!')
         elif diff > 0:
-            await self.channel.send(f'{self.cur_viewer} + {diff} ({stream_dur})!')
+            await self.channel.send(f'{self.cur_viewer} (+{diff}👤) ({stream_dur} 🕝)!')
         elif diff < 0:
-            await self.channel.send(f'{self.cur_viewer} - {diff} ({stream_dur})!')
+            await self.channel.send(f'{self.cur_viewer} ({diff}👤) ({stream_dur} 🕝)!')
         self.prew_viewers = self.cur_viewer
 
+    @commands.command(name='розыгрыш')
+    async def raffle(self, ctx: commands.Context, command: str = 'начать', atr: str = '+'):
+        if ctx.author.is_mod:
+            if command == 'начать':
+                self.raffle_key_word = '+'
+                self.raffle_player_list = []
+                self.raffle_key_word = atr if atr !='+' else '+'
+                self.raffle_flag = True
+                await ctx.send(f'Розыгрыш начался! Пиши {self.raffle_key_word}, чтобы участвовать!')
+            elif command == 'отстранить' and self.raffle_flag:
+                atr = atr.lower()
+                if '@' in atr:
+                    atr = atr.replace('@', '')
+                if atr in self.raffle_player_list:
+                    self.raffle_black_list.append(atr)
+                    self.raffle_player_list = [player for player in self.raffle_player_list if player != atr]
+                    await ctx.send(f'{atr} отстранён от розыгрыша!')
+            elif command == 'добавить' and self.raffle_flag:
+                atr = atr.lower()
+                if '@' in atr:
+                    atr = atr.replace('@', '')
+                if atr in self.raffle_black_list:
+                    self.raffle_black_list.remove(atr)
+                if atr not in self.raffle_player_list:
+                    self.raffle_player_list.append(atr)
+                    await ctx.send(f'{atr} записан на розыгрыш!')
+            elif command == 'очистить' and self.raffle_flag:
+                if atr == '+':
+                    self.raffle_player_list = []
+                    await ctx.send('Список участников очищен!')
+                elif atr == '-':
+                    self.raffle_black_list = []
+                    await ctx.send('Список отстранённый очищен!')
+                else:
+                    self.raffle_player_list = []
+                    await ctx.send('Список участников очищен!')
+            elif command == 'закончить' and self.raffle_flag:
+                if len(self.raffle_player_list) == 0:
+                    await ctx.send('В списке нет участников.')
+                    if atr == '-':
+                        await ctx.send('Розыгрыш завершён без определения победителя.')
+                        self.raffle_flag = False
+                        self.raffle_black_list = []
+                if len(self.raffle_player_list) != 0:
+                    self.raffle_flag = False
+                    self.raffle_key_word = '+'
+                    await ctx.send(f'{random.choice(self.raffle_player_list)} победил в розыгрыше!')
+                if atr == 'очистить':
+                    await ctx.send('Список участников очищен.')
+                    self.raffle_player_list = []
+                    self.raffle_black_list = []
+            elif command == 'список' and self.raffle_flag:
+                if atr == '+':
+                    uniq_player_list = set(self.raffle_player_list)
+                    await ctx.send(f'Список участников розыгрыша: {", ".join(uniq_player_list)}')
+                elif atr == '-':
+                    uniq_black_list = set(self.raffle_black_list)
+                    await ctx.send(f'Список отстранённых от розыгрыша: {", ".join(uniq_black_list)}')
+            elif not self.raffle_flag:
+                await ctx.send('Розыгрыш не был начат.')
+
+    @commands.command(name='фолоу', aliases=['фоллоу', 'followage'])
+    async def followage(self, ctx: commands.Context):
+        broadcaster = await self.fetch_users(names=[self.nickname])
+        broadcaster_id = broadcaster[0].id
+        follow_data = await self.http.get_channel_followers(broadcaster_id=broadcaster_id, user_id=ctx.author.id, token=self.token[6:])
+        if not follow_data:
+            await ctx.send(f'@{ctx.author.name} не подписан на канал.')
+            return
+        followed_at = follow_data[0]['followed_at']
+        if isinstance(followed_at, str):
+            followed_at = datetime.fromisoformat(followed_at.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        delta = now - followed_at
+        years = delta.days // 365
+        months = (delta.days % 365) // 30
+        days = (delta.days % 365) % 30
+        time_parts = [] # дата: год/месяц/день
+        if years: time_parts.append(f"{years} {'год' if years == 1 else 'года' if 2 <= years <= 4 else 'лет'}")
+        if months: time_parts.append(f"{months} {'месяцев' if months >= 5 or months == 0 else 'месяц' if months == 1 else 'месяца'}")
+        if days: time_parts.append(f"{days} {'дней' if days >= 5 or days == 0 else 'день' if days == 1 else 'дня'}")
+        if not time_parts:
+            await ctx.send(f'@{ctx.author.name} подписан на канал менее дня!')
+        else:
+            await ctx.send(f'@{ctx.author.name} подписан на канал уже {" ".join(time_parts)}!')
+
+    @commands.command(name='задача')
+    async def task(self, ctx: commands.Context):
+        x = random.randint(1, 100)
+        y = random.randint(1, 100)
+        arithmetic = {'+': lambda: x + y,
+                      '-': lambda: x - y,
+                      '*': lambda: x * y,
+                      '/': lambda: round(x / y, 2)}
+        operation = random.choice(list(arithmetic.keys()))
+        self.answer = arithmetic[operation]()
+        await ctx.send(f'Решите пример: {x} {operation} {y}')
+        self.task_flag = True
 
     # обработчик сообщений & будущая автомодерация
     async def event_message(self, message: Message):
         if message.author is None:
             pass # Игнорирование бота и системных сообщений
         else:
+            # Розыгрыши
+            if (self.raffle_flag and message.author.name not in self.raffle_player_list
+                    and message.content == self.raffle_key_word and message.author.name not in self.raffle_black_list):
+                self.raffle_player_list.append(message.author.name)
+                if message.author.is_subscriber:
+                    self.raffle_player_list.append(message.author.name)
+                await self.channel.send(f'{message.author.name} записан на розыгрыш!')
+            # Задача
+            if self.task_flag:
+                msg = str(message.content)
+                msg = msg.replace(',', '.')
+                print(msg, self.answer)
+                if msg == str(self.answer):
+                    await self.channel.send(f'{message.author.name} дал правильный ответ: {msg}!')
+                    self.task_flag = False
+            # Зрители
             self.message_count += 1
-            if self.message_count % 20 == 0:
+            if self.message_count % 50 == 0:
                 await self.viewer_timer()
             print(message.author.name, message.content)
             if message.author.name not in self.chatters:

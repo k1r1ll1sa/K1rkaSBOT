@@ -306,7 +306,6 @@ class Root(QMainWindow):
         token = self.token_lineedit.text()
         return token
 
-        self.bot_thread = None
     # действие для кнопки (запуск бота)
     def run_button(self):
             nickname_text = self.get_nickname()
