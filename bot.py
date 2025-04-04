@@ -173,6 +173,7 @@ class Bot(commands.Bot):
         if '\U000e0000' in phrase:
             phrase = phrase.replace('\U000e0000', '')
             phrase = phrase.strip()
+
         with open('info.json', 'r', encoding='utf-8') as f:
             info = json.load(f)
         if ctx.author.is_mod and command == 'добавить' and phrase != '':
