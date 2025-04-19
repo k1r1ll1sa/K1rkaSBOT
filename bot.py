@@ -1,19 +1,28 @@
 """Модуль с функционалом бота"""
 import random
-from os.path import split
+from operator import index
 
 import httpx
-import requests
 import urllib.parse
+import requests
+import twitchio.errors
+from certifi.core import exit_cacert_ctx
 from twitchio import Message
 from twitchio.ext import commands
+from twitchio.ext.commands import CommandOnCooldown, Cooldown, Bucket
 from twitchio.models import PartialUser
 from twitchio.http import TwitchHTTP
+from twitchio.errors import HTTPException
 import asyncio
 from datetime import datetime, timezone
 from dateutil.parser import parse
 from googletrans import Translator
 import json
+import itertools
+import re
+import rating
+
+rating = rating.Rating()
 
 def init_bot(nickname, root):
     try:
@@ -76,6 +85,23 @@ class Bot(commands.Bot):
         self.answer = 0
         self.task_flag = False
 
+        # Словарь для автомодерации RU & ENG
+        self.lit_dict = {"0": ["o", "о"],"1": ["i", "l", "!"],"2": ["z"],"3": ["e", "з", "е"],"4": ["ч", "h"],
+                         "5": ["s"],"6": ["b", "б"],"7": ["t"],"9": ["g"],"@": ["a", "а"],"#": ["h", "н"],"$": ["s"],
+                         "%": ["x"],"?": ["p"],"!": ["i"],"|": ["i", "l"], "a": ["а"],"b": ["в", "б", "ь", "ъ"],
+                         "c": ["с", "c"],"e": ["е", "ё"],"f": ["ф"],"g": ["д", "g"],"h": ["н"],"i": ["и"],"j": ["у"],
+                         "k": ["к"],"l": ["л"],"m": ["м"],"n": ["и", "п", "й"],"o": ["о"],"p": ["р", "п"],
+                         "r": ["г", "я"],"s": ["с", "з"],"t": ["т"],"u": ["у", "ц"],"v": ["u", "v"],"w": ["ш", "щ", "в"],
+                         "x": ["х"],"y": ["у", "й"], "(": ["с", "c"],")": ["j"],"<": ["k"],"+": ["х", "т"],
+                         "]": ["j"],"=": ["ж"],"^": ["л"],"}": ["д"],"Λ": ["л"]}
+        with open('banwords.txt', "r", encoding='utf-8') as file:
+            lines = file.readlines()
+            self.nword_list = lines[0].strip().split(', ')[1:]
+            self.allow_links = lines[1].strip().split(', ')[1:]
+
+        # Отслеживание фолловеров
+        self.last_followers = []
+
         super().__init__(
             prefix='!',
             token=self.token,
@@ -93,11 +119,21 @@ class Bot(commands.Bot):
         await self.channel.send(f'{self.nick} запущен!')
         self.root.console_add_line(f'{self.nick} is launched on the channel {self.nickname}')
 
+    async def event_follow(self, follower):
+        with open('info.json', 'r', encoding='utf-8') as file:
+            data = json.load(file)
+        if follower.name not in data['last_followers']:
+            await self.channel.send(f'{follower} спасибо за фолоу! Добро пожаловать на канал!')
+            data['last_followers'].append(follower.name)
+            with open('info.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+
     @commands.command(name='привет')
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def hello_command(self, ctx: commands.Context):
         await ctx.send(f'Привет, {ctx.author.name}! 👋')
         self.root.console_add_line(f'{ctx.author.name} uses the command "!привет"')
-
+    
     @commands.command(name='время')
     async def time(self, ctx: commands.Context):
         await ctx.send(f'{ctx.author.name} моё время: {datetime.datetime.now().strftime('%H:%M')}')
@@ -498,11 +534,105 @@ class Bot(commands.Bot):
         await ctx.send(f'Решите пример: {x} {operation} {y}')
         self.task_flag = True
 
-    # обработчик сообщений & будущая автомодерация
+    @commands.command(name='шутка')
+    async def joke(self, ctx: commands.Context):
+        joke = requests.get('https://official-joke-api.appspot.com/random_joke').json()
+        setup = joke['setup']
+        punchline = joke['punchline']
+        final_joke = (f'{setup} {punchline}')
+
+        translator = Translator()
+        trans_final_joke = await translator.translate(final_joke, dest='ru')
+        trans_text_joke = trans_final_joke.text
+        await ctx.send(f"ВНИМАНИЕ! Анекдот: {trans_text_joke}")
+
+    # Топ-5 чатеров по количеству сообщений
+    @commands.command(name='рейтинг')
+    async def rating(self, ctx: commands.Context):
+        top = rating.get_top_users()
+        await ctx.send(f'Топ чатеров по количеству сообщенйи: {", ".join([f"{1 + top.index(nick)}. {nick[0]}: "
+                       f"{nick[1]['message_count']} ✉️" for nick in top])}.'
+                       f' Ваше количество сообщений: {rating.get_msg(ctx.author.name)} 📫')
+
+    # Функция для автомодерации
+    def bunword_check(self, message):
+        def normalize_repeats(word):
+            if len(word) < 2:
+                return word
+            normalized = []
+            prev_char = word[0]
+            normalized.append(prev_char)
+            for char in word[1:]:
+                if char != prev_char:
+                    normalized.append(char)
+                    prev_char = char
+            return ''.join(normalized)
+        words = message.lower().split()
+
+        for word in words:
+            if len(word) > 20 or len(word) < 3:
+                continue
+            variants = []
+            word = normalize_repeats(word)
+            for char in word:
+                if char in self.lit_dict:
+                    variants.append([char] + self.lit_dict[char])
+                else:
+                    variants.append([char])
+            all_combinations = {''.join(combination) for combination in itertools.product(*variants)}
+            for ban_word in self.nword_list:
+                if ban_word.endswith('*'):
+                    base_word = ban_word[:-1]
+                    if any(comb.startswith(base_word) for comb in all_combinations):
+                        print("2")
+                        return True
+                else:
+                    if ban_word in all_combinations:
+                        print("2")
+                        return True
+        return False
+
+    # Определения наличия ссылок в сообщении
+    def links_check(self, message):
+        url_pattern = r'''(?:https?://|ftp://)(?:[a-z0-9-]+\.)+[a-z]{2,4}(?:[/?#][^\s]*)?|
+        \bwww\.(?:[a-z0-9-]+\.)+[a-z]{2,4}(?:[/?#][^\s]*)?|\b(?:[a-z0-9-]+\.){1,2}[a-z]{2,4}\b'''
+        urls = re.findall(url_pattern, message, re.VERBOSE | re.IGNORECASE)
+
+        for url in urls:
+            lower_url = url.lower()
+            if not any(allowed.lower() in lower_url for allowed in self.allow_links):
+                return True
+        return False
+
+        # обработчик сообщений
     async def event_message(self, message: Message):
         if message.author is None:
             pass # Игнорирование бота и системных сообщений
         else:
+            # Автомод
+            print(message.content)
+            rating.add_msg(message.author.name)
+            try:
+                if self.links_check(message.content):
+                    if rating.get_timeout(message.author.name) >= 5:
+                        await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
+                                                    duration=3600, reason='не используйте запрещённые ссылки')
+                    else:
+                        await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
+                                                     duration=5, reason='не используйте запрещённые ссылки')
+                    rating.add_timeout(message.author.name)
+                elif self.bunword_check(message.content):
+                    if rating.get_timeout(message.author.name) >= 5:
+                         await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
+                                                    duration=3600, reason='не используйте плохие слова в чате')
+                    else:
+                        await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
+                                                     duration=5, reason='не используйте плохие слова в чате')
+                    rating.add_timeout(message.author.name)
+                else:
+                    pass
+            except Exception as e:
+                print(e)
             # Розыгрыши
             if (self.raffle_flag and message.author.name not in self.raffle_player_list
                     and message.content == self.raffle_key_word and message.author.name not in self.raffle_black_list):
@@ -514,7 +644,6 @@ class Bot(commands.Bot):
             if self.task_flag:
                 msg = str(message.content)
                 msg = msg.replace(',', '.')
-                print(msg, self.answer)
                 if msg == str(self.answer):
                     await self.channel.send(f'{message.author.name} дал правильный ответ: {msg}!')
                     self.task_flag = False
@@ -522,7 +651,10 @@ class Bot(commands.Bot):
             self.message_count += 1
             if self.message_count % 50 == 0:
                 await self.viewer_timer()
-            print(message.author.name, message.content)
             if message.author.name not in self.chatters:
                 self.chatters.append(message.author.name)
             await self.handle_commands(message)
+
+    async def event_command_error(self, error: Exception, data: str = None):
+        if isinstance(error, CommandOnCooldown):
+            pass

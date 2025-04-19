@@ -1,5 +1,4 @@
 """Модуль для интерфейса программы"""
-import asyncio
 import os
 from urllib.parse import quote
 from PyQt5.QtCore import *

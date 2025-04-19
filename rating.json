@@ -1,0 +1,16 @@
+{
+  "rating": {
+    "sample user": {
+      "message_count": 15,
+      "timeout_count": 3
+    },
+    "k1rkas": {
+      "message_count": 53,
+      "timeout_count": 0
+    },
+    "az1mut_1": {
+      "message_count": 39,
+      "timeout_count": 0
+    }
+  }
+}
