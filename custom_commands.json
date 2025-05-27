@@ -1,0 +1,14 @@
+{
+    "custom_commands": {
+        "!дискорд": {
+            "text": "Заходи на дискорд сервер: https://discord.gg/pyFwkdTBsW !",
+            "access": "all",
+            "cooldown": 60
+        },
+        "!сыр": {
+            "text": "{name}, вы на {random(0, 100)}% сыр! 🧀",
+            "access": "all",
+            "cooldown": 60
+        }
+    }
+}

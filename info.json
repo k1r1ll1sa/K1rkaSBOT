@@ -1,6 +1,7 @@
 {
-    "nickname": "k1rkas",
-    "token": "v8jpou0ocwvbwqf3a0bhpb57goly56",
+    "nickname": "",
+    "token": "",
+    "volume": 50,
     "mine": {
         "1": "нашёл алмазы",
         "2": "нашёл гору угля",
@@ -13,7 +14,8 @@
         "9": "набрёл на аметистовую жеоду",
         "10": "нашёл спавнер зомби"
     },
-    "last_followers": [
-        "sample nickname"
-    ]
+    "adv": {
+        "desc": "",
+        "time": ""
+    }
 }

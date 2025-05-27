@@ -48,3 +48,12 @@ class Rating:
             reverse=True
         )
         return sorted_users[:top_n]
+
+    def get_top_users_timeouts(self, top_n=5):
+        users = self.data["rating"].items()
+        sorted_users = sorted(
+            users,
+            key=lambda x: x[1]["timeout_count"],
+            reverse=True
+        )
+        return sorted_users[:top_n]

@@ -1,18 +1,19 @@
 """Модуль с функционалом бота"""
 import random
-from operator import index
-
+import threading
+import time
+import io
+import subprocess, urllib.parse, urllib.request
+from bs4 import BeautifulSoup
+import aiohttp
 import httpx
 import urllib.parse
 import requests
-import twitchio.errors
-from certifi.core import exit_cacert_ctx
 from twitchio import Message
 from twitchio.ext import commands
-from twitchio.ext.commands import CommandOnCooldown, Cooldown, Bucket
+from twitchio.ext.commands import CommandOnCooldown
 from twitchio.models import PartialUser
 from twitchio.http import TwitchHTTP
-from twitchio.errors import HTTPException
 import asyncio
 from datetime import datetime, timezone
 from dateutil.parser import parse
@@ -24,7 +25,7 @@ import rating
 
 rating = rating.Rating()
 
-def init_bot(nickname, root):
+def init_bot(nickname, root, player):
     try:
         with open("tokens.json", "r", encoding="utf-8") as tokens:
             config = json.load(tokens)
@@ -35,14 +36,16 @@ def init_bot(nickname, root):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        bot = Bot(nickname, token, client_secret, client_id, root)
+        bot = Bot(nickname, token, client_secret, client_id, root, player)
         root.bot_instance = bot
+        root.console.set_bot(bot)
         loop.run_until_complete(bot.run())
     except Exception as e:
         print(e)
 
 class Bot(commands.Bot):
-    def __init__(self, nickname, token, client_secret, client_id, root):
+    def __init__(self, nickname, token, client_secret, client_id, root, player):
+        self.is_stream = False
         self.nickname = nickname
         self.channel = None
         self.nickname_ = "#" + nickname
@@ -55,6 +58,7 @@ class Bot(commands.Bot):
         self.http = TwitchHTTP(client_id=self.client_id, client=self, client_secret=self.client_secret)
         self.user = None # PartialUser
         self.bot_id = None
+        self.owner_id = ''
 
         # Рулетка
         self.lose_count = 6
@@ -73,7 +77,7 @@ class Bot(commands.Bot):
 
         # Отслеживание зрителей
         self.prew_viewers = 0
-        self.cur_viewers = 0
+        self.cur_viewer = 0
 
         # Розыгрыш
         self.raffle_key_word = '+'
@@ -94,13 +98,24 @@ class Bot(commands.Bot):
                          "r": ["г", "я"],"s": ["с", "з"],"t": ["т"],"u": ["у", "ц"],"v": ["u", "v"],"w": ["ш", "щ", "в"],
                          "x": ["х"],"y": ["у", "й"], "(": ["с", "c"],")": ["j"],"<": ["k"],"+": ["х", "т"],
                          "]": ["j"],"=": ["ж"],"^": ["л"],"}": ["д"],"Λ": ["л"]}
-        with open('banwords.txt', "r", encoding='utf-8') as file:
-            lines = file.readlines()
-            self.nword_list = lines[0].strip().split(', ')[1:]
-            self.allow_links = lines[1].strip().split(', ')[1:]
+
+        self.nword_list = []
+        self.allow_links = []
+        self.update_banwords()
 
         # Отслеживание фолловеров
-        self.last_followers = []
+        self.last_followers = set()
+
+        # Реклама
+        self.is_adv = False
+
+        # Кастомные команды
+        self.custom_commands = None
+        self.update_custom_commands()
+        self.cooldowns = {}
+
+        # Соунд реквесты
+        self.player = player
 
         super().__init__(
             prefix='!',
@@ -109,24 +124,119 @@ class Bot(commands.Bot):
             client_id=client_id,
             initial_channels=[self.nickname_])
 
+    def update_custom_commands(self):
+        with open('custom_commands.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        self.custom_commands = data["custom_commands"]
+
+    def handle_custom_commands(self, name, text, is_vip, is_mod):
+        current_time = time.time()
+        command_name = text.split()[0]
+        command = self.custom_commands.get(command_name)
+        message = ' '.join(text.split()[1:]) if len(text)>0 else ""
+
+        user_cooldowns = self.cooldowns.get(name, {})
+        if command_name in user_cooldowns and current_time < user_cooldowns[command_name]:
+            return ""
+
+        if command:
+            command_text = command.get("text")
+            command_text = self.process_command_text(command_text, name, message)
+            access_level = command.get("access", "all")
+            cooldown_time = command.get("cooldown", 60)
+
+            result = ""
+            if access_level == "all":
+                result = command_text
+            elif access_level == "vip" and is_vip:
+                result = command_text
+            elif access_level == "mod" and is_mod:
+                result = command_text
+
+            if result:
+                if name not in self.cooldowns:
+                    self.cooldowns[name] = {}
+                self.cooldowns[name][command_name] = current_time + cooldown_time
+
+            return result
+
+    def process_command_text(self, command_text, name, message):
+        command_text = command_text.replace("{name}", name)
+        command_text = command_text.replace("{msg}", message)
+        def random_replace(match):
+            min_val = int(match.group(1))
+            max_val = int(match.group(2))
+            random_number = random.randint(min_val, max_val)
+            return str(random_number)
+
+        command_text = re.sub(r'\{random\((\d+),\s*(\d+)\)\}', random_replace, command_text)
+        return command_text
+
+    def update_banwords(self):
+        with open('banwords.txt', "r", encoding='utf-8') as file:
+            lines = file.readlines()
+            self.nword_list = lines[0].strip().split(', ')[1:]
+            self.allow_links = lines[1].strip().split(', ')[1:]
+
     async def event_ready(self):
         self.channel = self.get_channel(self.nickname)
         owner = await self.fetch_users(names=[self.nickname])
-        owner_id = owner[0].id # для инициализации self.user, далее не нужен
+        self.owner_id = owner[0].id # для инициализации self.user, далее не нужен
         bot = await self.fetch_users(names=['k1rkasbot1k'])
         self.bot_id = bot[0].id
-        self.user = PartialUser(self.http, owner_id, self.nickname)
+        self.user = PartialUser(self.http, self.owner_id, self.nickname)
         await self.channel.send(f'{self.nick} запущен!')
-        self.root.console_add_line(f'{self.nick} is launched on the channel {self.nickname}')
+        await self.check_new_followers(True)
+        self.loop.create_task(self.follower_check_loop())
+        self.loop.create_task(self.advertisement())
+        self.loop.create_task(self.stream_data_check_loop())
+        self.root.console_add_line(f'{self.nick} is launched on the channel {self.nickname}', 'bot_launch')
 
-    async def event_follow(self, follower):
-        with open('info.json', 'r', encoding='utf-8') as file:
-            data = json.load(file)
-        if follower.name not in data['last_followers']:
-            await self.channel.send(f'{follower} спасибо за фолоу! Добро пожаловать на канал!')
-            data['last_followers'].append(follower.name)
-            with open('info.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+    # реклама
+    async def advertisement(self):
+        while True:
+            with open('info.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            desc, time = data['adv']['desc'], data['adv']['time']
+            await asyncio.sleep(int(time)*10)
+            if self.is_adv == True:
+                await self.channel.send(f'{desc}')
+
+    # Отслеживание новых фолов
+    async def get_recent_followers(self):
+        headers = {
+            'Client-ID': f'{self.client_id}',
+            'Authorization': f'Bearer {self.token[6:]}'
+        }
+        url = f'https://api.twitch.tv/helix/channels/followers?broadcaster_id={self.owner_id}&first=10'
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [f['user_name'] for f in data['data']]
+                else:
+                    return []
+
+    # Луп проверки новых фолов
+    async def follower_check_loop(self):
+        while True:
+            await asyncio.sleep(5)
+            await self.check_new_followers(False)
+
+    # Проверка наличие новых фоловеров и их приветствие
+    async def check_new_followers(self, first_flag):
+        current_followers = await self.get_recent_followers()
+        if not current_followers:
+            return
+        current_set = set(current_followers)
+        if first_flag:
+            self.last_followers = current_set
+            return
+        new_followers = current_set - self.last_followers
+        if new_followers:
+            followers_list = ", ".join([f"@{name}" for name in new_followers])
+            await self.channel.send(f"{followers_list}, добро пожаловать! Спасибо за фолов! 💜")
+            self.last_followers = current_set
 
     @commands.command(name='привет')
     @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
@@ -135,16 +245,19 @@ class Bot(commands.Bot):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!привет"')
     
     @commands.command(name='время')
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def time(self, ctx: commands.Context):
         await ctx.send(f'{ctx.author.name} моё время: {datetime.datetime.now().strftime('%H:%M')}')
         self.root.console_add_line(f'{ctx.author.name} uses the command "!время"')
 
     @commands.command(name='вуз')
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def university(self, ctx: commands.Context):
         await ctx.send(f'{ctx.author.name} бот написан в лучшем вузе на свете -> https://ikit.sfu-kras.ru')
         self.root.console_add_line(f'{ctx.author.name} uses the command "!вуз"')
 
     @commands.command(name='рулетка')
+    @commands.cooldown(rate=1, per=30, bucket=commands.Bucket.channel)
     async def roulette(self, ctx: commands.Context, count='1'):
         if '\U000e0000' in count:
             count = 1
@@ -191,6 +304,7 @@ class Bot(commands.Bot):
             return True
 
     @commands.command(name='кубик')
+    @commands.cooldown(rate=1, per=10, bucket=commands.Bucket.channel)
     async def roll(self, ctx: commands.Context, number=100):
         message = f'{ctx.author.name} uses the command "!кубик"' if number==100 \
             else f'{ctx.author.name} uses the command "!кубик" with arguments "{number}"'
@@ -204,8 +318,11 @@ class Bot(commands.Bot):
             await ctx.send(f'{ctx.author.name} выпало число {random_cube} 🎲')
 
     @commands.command(name='копать')
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def mine(self, ctx: commands.Context, command: str = '', *, phrase: str = ''):
-        self.root.console_add_line(f'{ctx.author.name} uses the command "!копать"')
+        message = f'{ctx.author.name} uses the command "!копать"' if command == '' \
+            else f'{ctx.author.name} uses the command "!копать" with arguments "{command} {phrase}"'
+        self.root.console_add_line(message)
         if '\U000e0000' in phrase:
             phrase = phrase.replace('\U000e0000', '')
             phrase = phrase.strip()
@@ -289,6 +406,7 @@ class Bot(commands.Bot):
         await ctx.send(f'{ctx.author.name} {phrase}!')
 
     @commands.command(name='чай')
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def tea(self, ctx: commands.Context, user=None):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!чай" with arguments {user}')\
             if user else self.root.console_add_line(f'{ctx.author.name} uses the command "!чай"')
@@ -304,6 +422,7 @@ class Bot(commands.Bot):
             await ctx.send(f'{ctx.author.name} угостил чаем {random.choice(self.chatters)}')
 
     @commands.command(name='бомба')
+    @commands.cooldown(rate=1, per=60, bucket=commands.Bucket.channel)
     async def bomb(self, ctx: commands.Context):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!бомба"')
         if self.correct_color is None:
@@ -311,6 +430,7 @@ class Bot(commands.Bot):
             self.correct_color = random.choice(self.colors)
 
     @commands.command(name='зелёный', aliases=['зеленый', 'green']) # с альтернативными вариантами
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def bomb_green(self, ctx: commands.Context):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!зелёный"')
         if self.correct_color is not None:
@@ -328,6 +448,7 @@ class Bot(commands.Bot):
             await ctx.send(f'{ctx.author.name} игра ещё не началась! пиши "!бомба"')
 
     @commands.command(name='красный')
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def bomb_red(self, ctx: commands.Context):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!красный"')
         if self.correct_color is not None:
@@ -345,6 +466,7 @@ class Bot(commands.Bot):
             await ctx.send(f'{ctx.author.name} игра ещё не началась! пиши "!бомба"')
 
     @commands.command(name='синий')
+    @commands.cooldown(rate=1, per=5, bucket=commands.Bucket.channel)
     async def bomb_blue(self, ctx: commands.Context):
         self.root.console_add_line(f'{ctx.author.name} uses the command "!синий"')
         if self.correct_color is not None:
@@ -362,6 +484,7 @@ class Bot(commands.Bot):
             await ctx.send(f'{ctx.author.name} игра ещё не началась! пиши "!бомба"')
 
     @commands.command(name='слово')
+    @commands.cooldown(rate=1, per=10, bucket=commands.Bucket.channel)
     async def word(self, ctx: commands.Context, word=None):
         self.root.console_add_line(f'{ctx.author.name} uses the command "слово" with arguments {word}') if word \
             else self.root.console_add_line(f'{ctx.author.name} uses the command "слово"')
@@ -388,8 +511,20 @@ class Bot(commands.Bot):
             await ctx.send(f'{ctx.author.name} такого слова нет в моём словаре!')
 
 
+    # проверка начала и конца трансляции
+    async def stream_data_check_loop(self):
+        while True:
+            await asyncio.sleep(7)
+            viewers, dur, data = await self.get_stream_data()
+            if len(data['data']) > 0 and not self.is_stream:
+                await self.channel.send('Трансляция запущена!')
+                self.is_stream = True
+            elif len(data['data']) == 0 and self.is_stream:
+                self.is_stream = False
+                await self.channel.send('Трансляция завершена!')
+
     # Получить data (кол-во зрителей и время трансляции)
-    async def get_viewer_count(self):
+    async def get_stream_data(self):
         nickname_ = "https://api.twitch.tv/helix/streams?user_login=" + self.nickname
         async with httpx.AsyncClient() as client:
             response = await client.get(nickname_, headers={
@@ -401,8 +536,8 @@ class Bot(commands.Bot):
                 viewer_count = data['data'][0]['viewer_count']
                 started_at = data['data'][0]['started_at']
                 stream_duration = self.calculate_stream_duration(started_at)
-                return viewer_count, stream_duration
-            return 0, 'Трансляция не ведется'
+                return viewer_count, stream_duration, data
+            return 0, 'трансляция не запущена', data
 
     def calculate_stream_duration(self, started_at):
         start_time = parse(started_at[:-1] if started_at.endswith('Z') else started_at)
@@ -413,8 +548,9 @@ class Bot(commands.Bot):
 
     @commands.command(name='зрители')
     async def viewers_info(self, ctx: commands.Context):
+        self.root.console_add_line(f'{ctx.author.name} uses the command "!зрители"')
         if ctx.author.is_mod:
-            self.cur_viewer, stream_dur = await self.get_viewer_count()
+            self.cur_viewer, stream_dur, _ = await self.get_stream_data()
             diff = self.cur_viewer - self.prew_viewers
             if diff == 0:
                 await ctx.send(f'{self.cur_viewer} ({stream_dur} 🕝)!')
@@ -425,7 +561,7 @@ class Bot(commands.Bot):
             self.prew_viewers = self.cur_viewer
 
     async def viewer_timer(self):
-        self.cur_viewer, stream_dur = await self.get_viewer_count()
+        self.cur_viewer, stream_dur, _ = await self.get_stream_data()
         diff = self.cur_viewer - self.prew_viewers
         if diff == 0:
             await self.channel.send(f'{self.cur_viewer} ({stream_dur} 🕝)!')
@@ -437,6 +573,10 @@ class Bot(commands.Bot):
 
     @commands.command(name='розыгрыш')
     async def raffle(self, ctx: commands.Context, command: str = 'начать', atr: str = '+'):
+        msg = command + atr
+        print(msg)
+        self.root.console_add_line(f'{ctx.author.name} uses the command "!розыгрыш" with arguments "{command} {atr}"') if msg != 'начать+' else\
+        self.root.console_add_line(f'{ctx.author.name} uses the command "!розыгрыш"')
         if ctx.author.is_mod:
             if command == 'начать':
                 self.raffle_key_word = '+'
@@ -497,6 +637,7 @@ class Bot(commands.Bot):
                 await ctx.send('Розыгрыш не был начат.')
 
     @commands.command(name='фолоу', aliases=['фоллоу', 'followage'])
+    @commands.cooldown(rate=1, per=10, bucket=commands.Bucket.channel)
     async def followage(self, ctx: commands.Context):
         broadcaster = await self.fetch_users(names=[self.nickname])
         broadcaster_id = broadcaster[0].id
@@ -522,6 +663,7 @@ class Bot(commands.Bot):
             await ctx.send(f'@{ctx.author.name} подписан на канал уже {" ".join(time_parts)}!')
 
     @commands.command(name='задача')
+    @commands.cooldown(rate=1, per=60, bucket=commands.Bucket.channel)
     async def task(self, ctx: commands.Context):
         x = random.randint(1, 100)
         y = random.randint(1, 100)
@@ -535,6 +677,7 @@ class Bot(commands.Bot):
         self.task_flag = True
 
     @commands.command(name='шутка')
+    @commands.cooldown(rate=1, per=10, bucket=commands.Bucket.channel)
     async def joke(self, ctx: commands.Context):
         joke = requests.get('https://official-joke-api.appspot.com/random_joke').json()
         setup = joke['setup']
@@ -548,6 +691,7 @@ class Bot(commands.Bot):
 
     # Топ-5 чатеров по количеству сообщений
     @commands.command(name='рейтинг')
+    @commands.cooldown(rate=1, per=60, bucket=commands.Bucket.channel)
     async def rating(self, ctx: commands.Context):
         top = rating.get_top_users()
         await ctx.send(f'Топ чатеров по количеству сообщенйи: {", ".join([f"{1 + top.index(nick)}. {nick[0]}: "
@@ -570,7 +714,7 @@ class Bot(commands.Bot):
         words = message.lower().split()
 
         for word in words:
-            if len(word) > 20 or len(word) < 3:
+            if len(word) > 15 or len(word) < 3:
                 continue
             variants = []
             word = normalize_repeats(word)
@@ -584,11 +728,9 @@ class Bot(commands.Bot):
                 if ban_word.endswith('*'):
                     base_word = ban_word[:-1]
                     if any(comb.startswith(base_word) for comb in all_combinations):
-                        print("2")
                         return True
                 else:
                     if ban_word in all_combinations:
-                        print("2")
                         return True
         return False
 
@@ -605,34 +747,112 @@ class Bot(commands.Bot):
         return False
 
         # обработчик сообщений
+
+    # Мульти (или нет) мут
+    @commands.command(name='мут')
+    async def mute(self, ctx: commands.Context, duration: int = 60, reason: str = "unknow reason", *, nicknames):
+        if ctx.author.is_mod:
+            nick_list = [n.strip() for n in nicknames.split(', ')]
+            proc_nicknames = []
+            for nickname in nick_list:
+                nickname = nickname.replace('@', '').replace('\U000e0000', '')
+                proc_nicknames.append(nickname.strip().lower())
+            #print(f'time: {duration}, reason: {reason}, nicks: {proc_nicknames}')
+            for nickname in proc_nicknames:
+                try:
+                    nick = await self.fetch_users(names=[nickname])
+                    nick_id = nick[0].id
+                    await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=str(nick_id),
+                                                 duration=int(duration), reason=str(reason))
+                except:
+                    continue
+
+    # Мульти (или нет) бан
+    @commands.command(name='бан')
+    async def ban(self, ctx: commands.Context, reason: str = "unknow reason", *, nicknames):
+        if ctx.author.is_mod:
+            nick_list = [n.strip() for n in nicknames.split(', ')]
+            proc_nicknames = []
+            for nickname in nick_list:
+                nickname = nickname.replace('@', '').replace('\U000e0000', '')
+                proc_nicknames.append(nickname.strip().lower())
+            #print(f'reason: {reason}, nicks: {proc_nicknames}')
+            for nickname in proc_nicknames:
+                try:
+                    nick = await self.fetch_users(names=[nickname])
+                    nick_id = nick[0].id
+                    await self.user.ban_user(token=self.token[6:], moderator_id=self.bot_id, user_id=str(nick_id),
+                                             reason=str(reason))
+                except Exception as e:
+                    print(e)
+                    continue
+
+
+    # Набор команд для управления саунд реквестами
+    @commands.command(name='реквест', aliases=['sr', 'музыка', 'песня'])
+    async def sound_request(self, ctx: commands.Context, url=None):
+        url = str(url).strip() if url is not None else None
+        if url and '\U000e0000' in url:
+            url = url.replace('\U000e0000', '').strip()
+        if url == '':
+            url = None
+        if ctx.author.is_mod or ctx.author.is_vip:
+            if url:
+                try:
+                    if self.player.add_to_queue(url):
+                        await ctx.send(f'{ctx.author.name}, трек добавлен в очередь!')
+                    else:
+                        await ctx.send(f'{ctx.author.name}, трек не подходит (длится дольше 5 минут или имеет меньше 50к просмотров)!')
+                except Exception as e:
+                    print(e)
+            elif self.player.current_song is not None:
+                await ctx.send(f'{ctx.author.name}, текущий трек: {self.player.current_song['title']}')
+            elif self.player.current_song is None:
+                await ctx.send(f'{ctx.author.name}, ничего не играет!')
+
+    @commands.command(name='пропуск', aliases=['skip', 'скип'])
+    @commands.cooldown(rate=1, per=120, bucket=commands.Bucket.channel)
+    async def skip(self, ctx: commands.Context):
+        if ctx.author.is_mod or ctx.author.is_vip:
+            if self.player.current_song:
+                self.player.skip()
+
+    @commands.command(name='пауза')
+    async def pause(self, ctx: commands.Context):
+        if ctx.author.is_broadcaster and not self.player.is_paused:
+            self.player.pause()
+            await ctx.send('Проигрывание приостановлено!')
+
+    @commands.command(name='продолжить')
+    async def resume(self, ctx: commands.Context):
+        if ctx.author.is_broadcaster and self.player.is_paused:
+            self.player.resume()
+            await ctx.send('Проигрывание возобновлено!')
+
+    @commands.command(name='громкость')
+    async def volume(self, ctx: commands.Context, volume: int):
+        if ctx.author.is_broadcaster:
+            self.player.set_volume(volume)
+            await ctx.send(f'Громкость проигрывателя изменена на {volume}')
+
     async def event_message(self, message: Message):
         if message.author is None:
             pass # Игнорирование бота и системных сообщений
         else:
-            # Автомод
+           # Автомод
             print(message.content)
             rating.add_msg(message.author.name)
             try:
                 if self.links_check(message.content):
-                    if rating.get_timeout(message.author.name) >= 5:
-                        await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
-                                                    duration=3600, reason='не используйте запрещённые ссылки')
-                    else:
-                        await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
-                                                     duration=5, reason='не используйте запрещённые ссылки')
+                    await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
+                                                 duration=5, reason='не используйте запрещённые ссылки')
                     rating.add_timeout(message.author.name)
                 elif self.bunword_check(message.content):
-                    if rating.get_timeout(message.author.name) >= 5:
-                         await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
-                                                    duration=3600, reason='не используйте плохие слова в чате')
-                    else:
-                        await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
-                                                     duration=5, reason='не используйте плохие слова в чате')
+                    await self.user.timeout_user(token=self.token[6:], moderator_id=self.bot_id, user_id=message.author.id,
+                                                 duration=5, reason='не используйте плохие слова в чате')
                     rating.add_timeout(message.author.name)
-                else:
-                    pass
             except Exception as e:
-                print(e)
+                pass
             # Розыгрыши
             if (self.raffle_flag and message.author.name not in self.raffle_player_list
                     and message.content == self.raffle_key_word and message.author.name not in self.raffle_black_list):
@@ -653,7 +873,13 @@ class Bot(commands.Bot):
                 await self.viewer_timer()
             if message.author.name not in self.chatters:
                 self.chatters.append(message.author.name)
+                # Кастомные команды
             await self.handle_commands(message)
+            response = self.handle_custom_commands(message.author.name, message.content, message.author.is_vip, message.author.is_mod)
+            if response is not None:
+                await self.channel.send(response)
+            else:
+                pass
 
     async def event_command_error(self, error: Exception, data: str = None):
         if isinstance(error, CommandOnCooldown):
